@@ -162,6 +162,10 @@ void SysTick_Handler(void)
 
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
+	
+  HAL_GPIO_TogglePin(GPIOB, LD3_Pin|LD2_Pin);
+
+	
 #if (INCLUDE_xTaskGetSchedulerState == 1 )
   if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
   {

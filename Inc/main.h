@@ -28,6 +28,7 @@ extern "C" {
 #endif
 
 /* Includes ------------------------------------------------------------------*/
+#include "cmsis_os.h"
 #include "stm32l4xx_hal.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -55,7 +56,7 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 
-char* hex2Str(unsigned char *data, size_t dataLen);
+extern osMutexId printMutex;
 
 /* USER CODE END EFP */
 
@@ -109,7 +110,7 @@ char* hex2Str(unsigned char *data, size_t dataLen);
 #define FALSE									0
 #define TRUE									1
 
-#define DPRINT(...)         	printf(__VA_ARGS__)
+#define DPRINT(...)         	{if (osMutexWait(printMutex, 10) == osOK) {osDelay(10); printf(__VA_ARGS__); osMutexRelease(printMutex);}}
 
 #define GPIO_Set(name)				HAL_GPIO_WritePin(name ## _GPIO_Port, name ## _Pin, GPIO_PIN_SET)
 #define GPIO_Clear(name)			HAL_GPIO_WritePin(name ## _GPIO_Port, name ## _Pin, GPIO_PIN_RESET)

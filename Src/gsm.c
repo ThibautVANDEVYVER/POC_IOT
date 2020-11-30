@@ -6,27 +6,22 @@
   */
 
 /* Includes ------------------------------------------------------------------*/
+
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
 
-#include "main.h"
 #include "cmsis_os.h"
+#include "main.h"
 #include "dma.h"
 #include "usart.h"
 #include "gsm.h"
 
-/* Define --------------------------------------------------------------------*/
-
-/* Private typedef -----------------------------------------------------------*/
-
-/* Private variables ---------------------------------------------------------*/
 
 /* Public variables ----------------------------------------------------------*/
 
 osMessageQueueId_t MsgTcpRx;
 osMessageQueueId_t MsgTcpTx;
-osMessageQueueId_t MsgTcpStatus;
 
 osThreadId_t gsmTaskHandle;
 const osThreadAttr_t gsmTask_attributes =
@@ -36,14 +31,9 @@ const osThreadAttr_t gsmTask_attributes =
   .stack_size = 128 * 4
 };
 
-/* Private function prototypes -----------------------------------------------*/
 
 /* Defines -------------------------------------------------------------------*/
-#define GSM_BUF_SIZE									(64)
-#define GSM_TCP_SEND_NB								(8)
-
-#define	GSM_IP_ADDRESS								("dpedesign.freeboxos.fr")	// Server IP address
-#define	GSM_TCP_PORT									("23456")										// Server TCP port
+#define GSM_BUF_LEN										(64)
 
 // INIT
 #define	GSM_POWER_OFF_TIME						(200)
@@ -77,7 +67,18 @@ const osThreadAttr_t gsmTask_attributes =
 // STOP
 #define	GSM_STOP_RETRY								(1)
 
+// SOCKET
+#define SOCKET_INIT_TIMEOUT						(10000)
+#define SOCKET_OPEN_TIMEOUT						(10000)
+
+#define GSM_HOSTNAME_LEN							(32)
+#define GSM_TCP_PORT_LEN							(6)
+
+#define GSM_MSG_TCP_NB	        			(8)
+#define GSM_MSG_TCP_LEN   						(64)
+
 /* Private typedef -----------------------------------------------------------*/
+
 typedef enum
 {
 	GSM_STATE_INIT = 0,
@@ -111,14 +112,30 @@ typedef enum
 
 typedef struct
 {
-	char txbuf[GSM_BUF_SIZE];
-	char rxbuf1[GSM_BUF_SIZE];
-	char rxbuf2[GSM_BUF_SIZE];
+	char tx_buf[GSM_BUF_LEN];
+	char rx_buf1[GSM_BUF_LEN];
+	char rx_buf2[GSM_BUF_LEN];
 	uint32_t time;
 	uint8_t skip;
 } StructAT;
 
+typedef enum
+{
+	GSM_STATUS_STOP				= 0,
+	GSM_STATUS_INIT,
+	GSM_STATUS_CONNECTING,
+	GSM_STATUS_CONNECTED,
+} gsm_status_t;
+
+typedef struct
+{
+	uint8_t data[GSM_MSG_TCP_LEN];
+	uint32_t len;
+} gsm_msg_tcp_t;
+
+
 /* Constants -----------------------------------------------------------------*/
+
 const StructAT sGsmATStart[] =
 {
 	{"AT\r\n"              									, ""						, "OK\r\n"	, 1000	, 0},	// Check UART communication
@@ -171,23 +188,23 @@ const StructAT sGsmATStop[] =
 	{"AT+QPOWD=1\r\n"       								, "" , "OK\r\n"			, 1000	, 0},	// Power down
 };
 
+
 /* Private variables ---------------------------------------------------------*/
-struct
+
+static struct
 {
 	gsm_state_t state;
-	gsm_status_t status;
-	uint32_t idx;
-	uint32_t time;
-	uint32_t retry;
-	uint32_t rxsize;
-	uint8_t txbuf[GSM_BUF_SIZE + 1];
-	uint8_t rxbuf[GSM_BUF_SIZE + 1];
-	char ip_addr[32];
-	char tcp_port[32];
+	uint32_t init				: 1;
+	uint32_t connect		: 1;
+	uint32_t close			: 1;
+	uint32_t dummy			: 29;
+	char hostname[GSM_HOSTNAME_LEN];
+	char tcp_port[GSM_TCP_PORT_LEN];
 } gsm;
 
 static gsm_msg_tcp_t msg_tcp_rx;
 static gsm_msg_tcp_t msg_tcp_tx;
+
 
 /* Private functions ---------------------------------------------------------*/
 
@@ -197,23 +214,15 @@ static gsm_msg_tcp_t msg_tcp_tx;
 static void GSM_Init(void)
 {
 	// Init variables
+	memset(&gsm, 0, sizeof(gsm));
 	gsm.state = GSM_STATE_INIT;
-	gsm.status = GSM_STATUS_STOP;
-	gsm.idx = 0;
-	gsm.time = 0;
-	gsm.retry = 0;
-	gsm.rxsize = 0;
-	memset(gsm.txbuf, 0, sizeof(gsm.txbuf));
-	memset(gsm.rxbuf, 0, sizeof(gsm.rxbuf));
-	strcpy(gsm.ip_addr, GSM_IP_ADDRESS);
-	strcpy(gsm.tcp_port, GSM_TCP_PORT);
 	
 	// Init UART
 	MX_DMA_Init();
 	MX_USART3_UART_Init();	
 }
 
-/* Public functions ----------------------------------------------------------*/
+/* Extern functions ----------------------------------------------------------*/
 
 /**
   * @brief  GSM task
@@ -222,47 +231,60 @@ static void GSM_Init(void)
   */
 void StartGsmTask(void *argument)
 {
+	uint32_t idx;
+	uint32_t time;
+	uint32_t retry;
+	uint32_t rx_len;
+	uint8_t tx_buf[GSM_BUF_LEN + 1];
+	uint8_t rx_buf[GSM_BUF_LEN + 1];
+	
 	// Init Messages
 	MsgTcpRx = osMessageQueueNew(GSM_MSG_TCP_NB, sizeof(gsm_msg_tcp_t), NULL);
   MsgTcpTx = osMessageQueueNew(GSM_MSG_TCP_NB, sizeof(gsm_msg_tcp_t), NULL);
-  MsgTcpStatus = osMessageQueueNew(1, sizeof(gsm_status_t), NULL);
-	
-	// Init state
-	gsm.state = GSM_STATE_INIT;
+
+	// Init GSM
+	GSM_Init();
 	
   /* Infinite loop */
   while (1)
   {
 		// Update received size
-		uint32_t remain_size = __HAL_DMA_GET_COUNTER(&hdma_usart3_rx);
-		gsm.rxsize = (GSM_BUF_SIZE > remain_size) ? (GSM_BUF_SIZE - remain_size) : 0;
-	
+		uint32_t remain_len = __HAL_DMA_GET_COUNTER(&hdma_usart3_rx);
+		rx_len = (GSM_BUF_LEN > remain_len) ? (GSM_BUF_LEN - remain_len) : 0;
+		
 		// State
 		switch (gsm.state)
 		{
 			case GSM_STATE_INIT:
 			{
-				// Init GSM
-				DPRINT("%04d| GSM : INIT\n", HAL_GetTick()/1000);
-				GSM_Init();
 				// Reset module
-				DPRINT("%04d| GSM : POWER OFF\n", HAL_GetTick()/1000);
 				GPIO_Clear(OUT_PWRKEY_GSM);
 				GPIO_Set(OUT_RST_GSM);
-				osDelay(GSM_POWER_OFF_TIME);
-				DPRINT("%04d| GSM : POWER ON\n", HAL_GetTick()/1000);
-				GPIO_Clear(OUT_PWRKEY_GSM);
-				GPIO_Clear(OUT_RST_GSM);
-				osDelay(GSM_POWER_ON_TIME);
-				// Turn ON module
-				DPRINT("%04d| GSM : PWRKEY PRESSED\n", HAL_GetTick()/1000);
-				GPIO_Set(OUT_PWRKEY_GSM);
-				osDelay(GSM_PRESS_TIME);
-				DPRINT("%04d| GSM : PWRKEY RELEASED\n", HAL_GetTick()/1000);
-				GPIO_Clear(OUT_PWRKEY_GSM);
-				// Next state
-				gsm.time = HAL_GetTick();
-				gsm.state = GSM_STATE_CK_STATUS;
+				// Wait for init
+				if (gsm.init)
+				{
+					// Init GSM
+					DPRINT("%04d| GSM : INIT\n", HAL_GetTick()/1000);
+					GSM_Init();
+					// Reset module
+					DPRINT("%04d| GSM : POWER OFF\n", HAL_GetTick()/1000);
+					GPIO_Clear(OUT_PWRKEY_GSM);
+					GPIO_Set(OUT_RST_GSM);
+					osDelay(GSM_POWER_OFF_TIME);
+					DPRINT("%04d| GSM : POWER ON\n", HAL_GetTick()/1000);
+					GPIO_Clear(OUT_PWRKEY_GSM);
+					GPIO_Clear(OUT_RST_GSM);
+					osDelay(GSM_POWER_ON_TIME);
+					// Turn ON module
+					DPRINT("%04d| GSM : PWRKEY PRESSED\n", HAL_GetTick()/1000);
+					GPIO_Set(OUT_PWRKEY_GSM);
+					osDelay(GSM_PRESS_TIME);
+					DPRINT("%04d| GSM : PWRKEY RELEASED\n", HAL_GetTick()/1000);
+					GPIO_Clear(OUT_PWRKEY_GSM);
+					// Next state
+					time = HAL_GetTick();
+					gsm.state = GSM_STATE_CK_STATUS;
+				}
 			}
 			break;
 			
@@ -275,7 +297,7 @@ void StartGsmTask(void *argument)
 					gsm.state = GSM_STATE_START_INIT;
 				}
 				// Check timeout
-				if ((HAL_GetTick() - gsm.time) > GSM_CK_STATUS_TIMEOUT)
+				if ((HAL_GetTick() - time) > GSM_CK_STATUS_TIMEOUT)
 				{
 					DPRINT("%04d| GSM : STATUS TIMEOUT\n", HAL_GetTick()/1000);
 					gsm.state = GSM_STATE_INIT;
@@ -286,8 +308,8 @@ void StartGsmTask(void *argument)
 			case GSM_STATE_START_INIT:
 			{
 				DPRINT("%04d| GSM : AT START\n", HAL_GetTick()/1000);
-				gsm.idx = 0;
-				gsm.retry = 0;
+				idx = 0;
+				retry = 0;
 				gsm.state = GSM_STATE_START_TX;
 			}
 			break;
@@ -295,37 +317,37 @@ void StartGsmTask(void *argument)
 			{
 				// Flush rx buffer & relaunch reception
 				HAL_UART_Abort(&huart3);
-				memset(gsm.rxbuf, 0, sizeof(gsm.rxbuf));
-				HAL_UART_Receive_DMA(&huart3, gsm.rxbuf, GSM_BUF_SIZE);
+				memset(rx_buf, 0, sizeof(rx_buf));
+				HAL_UART_Receive_DMA(&huart3, rx_buf, GSM_BUF_LEN);
 				// Send command
-				memset(gsm.txbuf, 0, sizeof(gsm.txbuf));
-				strcpy((char *)gsm.txbuf, sGsmATStart[gsm.idx].txbuf);
-				DPRINT("%04d| GSM : AT START %d -> TX\n", HAL_GetTick()/1000, gsm.idx);
+				memset(tx_buf, 0, sizeof(tx_buf));
+				strcpy((char *)tx_buf, sGsmATStart[idx].tx_buf);
+				DPRINT("%04d| GSM : AT START %d -> TX\n", HAL_GetTick()/1000, idx);
 #ifdef PRINT_GSM_TX
-				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.txbuf);
+				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, tx_buf);
 #endif
-				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)gsm.txbuf, strlen((char *)gsm.txbuf));			
-				gsm.time = HAL_GetTick();
+				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)tx_buf, strlen((char *)tx_buf));			
+				time = HAL_GetTick();
 				gsm.state = GSM_STATE_START_RX;
 			}
 			break;
 			case GSM_STATE_START_RX:
 			{
 				// Check timeout
-				if ((HAL_GetTick() - gsm.time) > sGsmATStart[gsm.idx].time)
+				if ((HAL_GetTick() - time) > sGsmATStart[idx].time)
 				{
-					DPRINT("%04d| GSM : AT START %d -> TIMEOUT\n", HAL_GetTick()/1000, gsm.idx);
+					DPRINT("%04d| GSM : AT START %d -> TIMEOUT\n", HAL_GetTick()/1000, idx);
 #ifdef PRINT_GSM_RX
-					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
-					gsm.retry++;
-					if (gsm.retry > GSM_START_RETRY)
+					retry++;
+					if (retry > GSM_START_RETRY)
 					{
-						if (sGsmATStart[gsm.idx].skip > 0)
+						if (sGsmATStart[idx].skip > 0)
 						{
-							gsm.idx++; 
+							idx++; 
 							uint32_t nb_at = sizeof(sGsmATStart) / sizeof(sGsmATStart[0]);
-							if (gsm.idx < nb_at) {gsm.state = GSM_STATE_START_TX;}
+							if (idx < nb_at) {gsm.state = GSM_STATE_START_TX;}
 							else {gsm.state = GSM_STATE_TCP_CONNECT_INIT;}
 						}
 						else
@@ -341,19 +363,19 @@ void StartGsmTask(void *argument)
 				else
 				{
 					// Check received buffer
-					char *ptr = strstr((char *)gsm.rxbuf, sGsmATStart[gsm.idx].rxbuf1);
+					char *ptr = strstr((char *)rx_buf, sGsmATStart[idx].rx_buf1);
 					if (ptr != NULL)
 					{
-						ptr = strstr(ptr, sGsmATStart[gsm.idx].rxbuf2);
+						ptr = strstr(ptr, sGsmATStart[idx].rx_buf2);
 						if (ptr != NULL)
 						{
-							DPRINT("%04d| GSM : AT START %d -> RX OK\n", HAL_GetTick()/1000, gsm.idx);
+							DPRINT("%04d| GSM : AT START %d -> RX OK\n", HAL_GetTick()/1000, idx);
 #ifdef PRINT_GSM_RX
-							DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+							DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
-							gsm.idx += 1 + sGsmATStart[gsm.idx].skip;
+							idx += 1 + sGsmATStart[idx].skip;
 							uint32_t nb_at = sizeof(sGsmATStart) / sizeof(sGsmATStart[0]);
-							if (gsm.idx < nb_at) {gsm.state = GSM_STATE_START_TX;}
+							if (idx < nb_at) {gsm.state = GSM_STATE_START_TX;}
 							else {gsm.state = GSM_STATE_TCP_CONNECT_INIT;}
 						}
 					}
@@ -363,44 +385,47 @@ void StartGsmTask(void *argument)
 		
 			case GSM_STATE_TCP_CONNECT_INIT:
 			{
-				DPRINT("%04d| GSM : TCP CONNECT\n", HAL_GetTick()/1000);
-				gsm.retry = 0;
-				gsm.state = GSM_STATE_TCP_CONNECT_TX;
+				if (gsm.connect)
+				{
+					DPRINT("%04d| GSM : TCP CONNECT\n", HAL_GetTick()/1000);
+					retry = 0;
+					gsm.state = GSM_STATE_TCP_CONNECT_TX;
+				}
 			}
 			break;
 			case GSM_STATE_TCP_CONNECT_TX:
 			{
 				// Flush rx buffer & relaunch reception
 				HAL_UART_Abort(&huart3);
-				memset(gsm.rxbuf, 0, sizeof(gsm.rxbuf));
-				HAL_UART_Receive_DMA(&huart3, gsm.rxbuf, GSM_BUF_SIZE);
+				memset(rx_buf, 0, sizeof(rx_buf));
+				HAL_UART_Receive_DMA(&huart3, rx_buf, GSM_BUF_LEN);
 				// Send command
-				sprintf((char *)gsm.txbuf, GSM_TCP_CONNECT_TX_STR, gsm.ip_addr, gsm.tcp_port);
+				sprintf((char *)tx_buf, GSM_TCP_CONNECT_TX_STR, gsm.hostname, gsm.tcp_port);
 				DPRINT("%04d| GSM : TCP CONNECT -> TX\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_TX
-				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.txbuf);
+				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, tx_buf);
 #endif
-				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)gsm.txbuf, strlen((char *)gsm.txbuf));			
-				gsm.time = HAL_GetTick();
+				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)tx_buf, strlen((char *)tx_buf));			
+				time = HAL_GetTick();
 				gsm.state = GSM_STATE_TCP_CONNECT_RX;
 				break;
 			case GSM_STATE_TCP_CONNECT_RX:
 				// Check timeout
-				if ((HAL_GetTick() - gsm.time) > GSM_TCP_CONNECT_TIMEOUT)
+				if ((HAL_GetTick() - time) > GSM_TCP_CONNECT_TIMEOUT)
 				{
 					DPRINT("%04d| GSM : TCP CONNECT -> TIMEOUT\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_RX
-					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
-					gsm.retry++;
-					if (gsm.retry > GSM_TCP_CONNECT_RETRY) {gsm.state = GSM_STATE_STOP_INIT;}
+					retry++;
+					if (retry > GSM_TCP_CONNECT_RETRY) {gsm.state = GSM_STATE_STOP_INIT;}
 					else {gsm.state = GSM_STATE_TCP_CONNECT_TX;}
 				}
-				else if (strstr((char *)gsm.rxbuf, GSM_TCP_CONNECT_RX_STR) != NULL)
+				else if (strstr((char *)rx_buf, GSM_TCP_CONNECT_RX_STR) != NULL)
 				{
 					DPRINT("%04d| GSM : TCP CONNECT -> RX OK\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_RX
-					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
 					gsm.state = GSM_STATE_TCP_RECV_INIT;
 				}
@@ -412,9 +437,9 @@ void StartGsmTask(void *argument)
 				DPRINT("%04d| GSM : TCP RECV\n", HAL_GetTick()/1000);
 				// Flush rx buffer & relaunch reception
 				HAL_UART_Abort(&huart3);
-				memset(gsm.rxbuf, 0, sizeof(gsm.rxbuf));
-				HAL_UART_Receive_DMA(&huart3, gsm.rxbuf, GSM_BUF_SIZE);
-				gsm.time = HAL_GetTick();
+				memset(rx_buf, 0, sizeof(rx_buf));
+				HAL_UART_Receive_DMA(&huart3, rx_buf, GSM_BUF_LEN);
+				time = HAL_GetTick();
 				gsm.state = GSM_STATE_TCP_RECV_RX;
 			}
 			break;
@@ -423,6 +448,7 @@ void StartGsmTask(void *argument)
 				// Check data to send
 				if (osMessageQueueGet(MsgTcpTx, &msg_tcp_tx, NULL, 0U) == osOK)
 				{
+					msg_tcp_tx.data[msg_tcp_tx.len] = '\0';
 					DPRINT("%04d| GSM : TCP MSG= %s\n", HAL_GetTick()/1000, (char *)msg_tcp_tx.data);
 					gsm.state = GSM_STATE_TCP_SEND_INIT;
 				}
@@ -431,8 +457,8 @@ void StartGsmTask(void *argument)
 				{
 					char *ptr1;
 					uint32_t idx = 0;
-					while( ((ptr1 = strstr((char *)&gsm.rxbuf[idx], GSM_TCP_RECV_RX_STR)) == NULL) && (idx < GSM_BUF_SIZE) ) {idx++;}
-					if (idx < GSM_BUF_SIZE)
+					while( ((ptr1 = strstr((char *)&rx_buf[idx], GSM_TCP_RECV_RX_STR)) == NULL) && (idx < GSM_BUF_LEN) ) {idx++;}
+					if (idx < GSM_BUF_LEN)
 					{
 						ptr1 += strlen(GSM_TCP_RECV_RX_STR);
 						// Check Connection Closed
@@ -445,27 +471,26 @@ void StartGsmTask(void *argument)
 						{
 							ptr1 += strlen(GSM_TCP_RECV_DATA_STR);
 							// Check size of received buffer
-							uint32_t data_size;
-							if (sscanf(ptr1, "%d\r\n", &data_size) > 0)
+							uint32_t data_len;
+							if (sscanf(ptr1, "%d\r\n", &data_len) > 0)
 							{
-								if (data_size < GSM_BUF_SIZE)
+								if (data_len < GSM_BUF_LEN)
 								{
 									if ((ptr1 = strstr(ptr1, "\r\n")) != NULL)
 									{
 										ptr1 += strlen("\r\n");
-										uint32_t recv_size = (uint32_t)gsm.rxbuf + gsm.rxsize;
-										recv_size = (recv_size > (uint32_t)ptr1) ? (recv_size - (uint32_t)ptr1) : 0;
-										if (recv_size >= data_size)
+										uint32_t recv_len = (uint32_t)rx_buf + rx_len;
+										recv_len = (recv_len > (uint32_t)ptr1) ? (recv_len - (uint32_t)ptr1) : 0;
+										if (recv_len >= data_len)
 										{
 											DPRINT("%04d| GSM : TCP RECV -> RX OK\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_RX
-											char *ptr2 = ptr1; while( (isalnum(*ptr2) || ispunct(*ptr2) || isspace(*ptr2)) && (*ptr2 != '\0') ) {ptr2++;}
-											if (*ptr2 == '\0') {DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, ptr1);}
-											else {DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, hex2Str((uint8_t *)ptr1, data_size));}//strlen(ptr1)));}
+											ptr1[data_len] = '\0';
+//											DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, ptr1);
 #endif
 											// Update received data
-											memcpy(msg_tcp_rx.data, ptr1, data_size);
-											msg_tcp_rx.size = data_size;
+											memcpy(msg_tcp_rx.data, ptr1, data_len);
+											msg_tcp_rx.len = data_len;
 											osMessageQueuePut(MsgTcpRx, &msg_tcp_rx, NULL, 0U);
 											// Relaunch reception
 											gsm.state = GSM_STATE_TCP_RECV_INIT;
@@ -477,7 +502,7 @@ void StartGsmTask(void *argument)
 					}
 				}
 				// Check timeout
-				if ((HAL_GetTick() - gsm.time) > GSM_TCP_RECV_TIMEOUT)
+				if ((HAL_GetTick() - time) > GSM_TCP_RECV_TIMEOUT)
 				{
 					// Relaunch reception
 					gsm.state = GSM_STATE_TCP_RECV_INIT;
@@ -488,7 +513,7 @@ void StartGsmTask(void *argument)
 			case GSM_STATE_TCP_SEND_INIT:
 			{
 				DPRINT("%04d| GSM : TCP SEND\n", HAL_GetTick()/1000);
-				gsm.retry = 0;
+				retry = 0;
 				gsm.state = GSM_STATE_TCP_SEND1_TX;
 			}
 			break;
@@ -496,38 +521,38 @@ void StartGsmTask(void *argument)
 			{
 				// Flush rx buffer & relaunch reception
 				HAL_UART_Abort(&huart3);
-				memset(gsm.rxbuf, 0, sizeof(gsm.rxbuf));
-				HAL_UART_Receive_DMA(&huart3, gsm.rxbuf, GSM_BUF_SIZE);
+				memset(rx_buf, 0, sizeof(rx_buf));
+				HAL_UART_Receive_DMA(&huart3, rx_buf, GSM_BUF_LEN);
 				// Send command
-				sprintf((char *)gsm.txbuf, GSM_TCP_SEND1_TX_STR, msg_tcp_tx.size);
+				sprintf((char *)tx_buf, GSM_TCP_SEND1_TX_STR, msg_tcp_tx.len);
 				DPRINT("%04d| GSM : TCP SEND 1 -> TX\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_TX
-				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.txbuf);
+				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, tx_buf);
 #endif
-				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)gsm.txbuf, strlen((char *)gsm.txbuf));			
-				gsm.time = HAL_GetTick();
+				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)tx_buf, strlen((char *)tx_buf));			
+				time = HAL_GetTick();
 				gsm.state = GSM_STATE_TCP_SEND1_RX;
 			}
 			break;
 			case GSM_STATE_TCP_SEND1_RX:
 			{
 				// Check timeout
-				if ((HAL_GetTick() - gsm.time) > GSM_TCP_SEND1_TIMEOUT)
+				if ((HAL_GetTick() - time) > GSM_TCP_SEND1_TIMEOUT)
 				{
 					DPRINT("%04d| GSM : TCP SEND 1 -> TIMEOUT\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_RX
-					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
-					gsm.retry++;
-					if (gsm.retry > GSM_TCP_SEND_RETRY) {gsm.state = GSM_STATE_STOP_INIT;}
+					retry++;
+					if (retry > GSM_TCP_SEND_RETRY) {gsm.state = GSM_STATE_STOP_INIT;}
 					else {gsm.state = GSM_STATE_TCP_SEND1_TX;}
 				}
 				// Check received buffer
-				else if (strstr((char *)gsm.rxbuf, GSM_TCP_SEND1_RX_STR) != NULL)
+				else if (strstr((char *)rx_buf, GSM_TCP_SEND1_RX_STR) != NULL)
 				{
 					DPRINT("%04d| GSM : TCP SEND 1 -> RX OK\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_RX
-					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
 					gsm.state = GSM_STATE_TCP_SEND2_TX;
 				}
@@ -537,40 +562,40 @@ void StartGsmTask(void *argument)
 			{
 				// Flush rx buffer & relaunch reception
 				HAL_UART_Abort(&huart3);
-				memset(gsm.rxbuf, 0, sizeof(gsm.rxbuf));
-				HAL_UART_Receive_DMA(&huart3, gsm.rxbuf, GSM_BUF_SIZE);
+				memset(rx_buf, 0, sizeof(rx_buf));
+				HAL_UART_Receive_DMA(&huart3, rx_buf, GSM_BUF_LEN);
 				// Send command
-				memset(gsm.txbuf, 0, sizeof(gsm.txbuf));
-				memcpy(gsm.txbuf, msg_tcp_tx.data, msg_tcp_tx.size);
+				memset(tx_buf, 0, sizeof(tx_buf));
+				memcpy(tx_buf, msg_tcp_tx.data, msg_tcp_tx.len);
 				DPRINT("%04d| GSM : TCP SEND 2 -> TX\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_TX
-				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, hex2Str(gsm.txbuf, msg_tcp_tx.size));
+				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, tx_buf);
 #endif
-				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)gsm.txbuf, msg_tcp_tx.size);
-				gsm.time = HAL_GetTick();
+				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)tx_buf, msg_tcp_tx.len);
+				time = HAL_GetTick();
 				gsm.state = GSM_STATE_TCP_SEND2_RX;
 			}
 			break;
 			case GSM_STATE_TCP_SEND2_RX:
 			{
 				// Check timeout
-				if ((HAL_GetTick() - gsm.time) > GSM_TCP_SEND2_TIMEOUT)
+				if ((HAL_GetTick() - time) > GSM_TCP_SEND2_TIMEOUT)
 				{
 					DPRINT("%04d| GSM : TCP SEND 2 -> TIMEOUT\n", HAL_GetTick()/1000);
-					gsm.retry++;
-					if (gsm.retry > GSM_TCP_SEND_RETRY) {gsm.state = GSM_STATE_STOP_INIT;}
+					retry++;
+					if (retry > GSM_TCP_SEND_RETRY) {gsm.state = GSM_STATE_STOP_INIT;}
 					else {gsm.state = GSM_STATE_TCP_SEND1_TX;}
 				}
 				// Check received buffer
 				else
 				{
-					uint32_t idx = 0, idx_max = (GSM_BUF_SIZE > strlen(GSM_TCP_SEND2_RX_STR)) ? (GSM_BUF_SIZE - strlen(GSM_TCP_SEND2_RX_STR)) : 0;
-					while( (memcmp(&gsm.rxbuf[idx], GSM_TCP_SEND2_RX_STR, strlen(GSM_TCP_SEND2_RX_STR)) != 0) && (idx < idx_max) ) {idx++;}
+					uint32_t idx = 0, idx_max = (GSM_BUF_LEN > strlen(GSM_TCP_SEND2_RX_STR)) ? (GSM_BUF_LEN - strlen(GSM_TCP_SEND2_RX_STR)) : 0;
+					while( (memcmp(&rx_buf[idx], GSM_TCP_SEND2_RX_STR, strlen(GSM_TCP_SEND2_RX_STR)) != 0) && (idx < idx_max) ) {idx++;}
 					if (idx < idx_max)
 					{
 						DPRINT("%04d| GSM : TCP SEND 2 -> RX OK\n", HAL_GetTick()/1000);
 #ifdef PRINT_GSM_RX
-						DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+						DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
 						// Relaunch reception
 						gsm.state = GSM_STATE_TCP_RECV_INIT;
@@ -582,8 +607,8 @@ void StartGsmTask(void *argument)
 			case GSM_STATE_STOP_INIT:
 			{
 				DPRINT("%04d| GSM : AT STOP\n", HAL_GetTick()/1000);
-				gsm.idx = 0;
-				gsm.retry = 0;
+				idx = 0;
+				retry = 0;
 				gsm.state = GSM_STATE_STOP_TX;
 			}
 			break;
@@ -591,49 +616,49 @@ void StartGsmTask(void *argument)
 			{
 				// Flush rx buffer & relaunch reception
 				HAL_UART_Abort(&huart3);
-				memset(gsm.rxbuf, 0, sizeof(gsm.rxbuf));
-				HAL_UART_Receive_DMA(&huart3, gsm.rxbuf, GSM_BUF_SIZE);
+				memset(rx_buf, 0, sizeof(rx_buf));
+				HAL_UART_Receive_DMA(&huart3, rx_buf, GSM_BUF_LEN);
 				// Send command
-				memset(gsm.txbuf, 0, sizeof(gsm.txbuf));
-				strcpy((char *)gsm.txbuf, sGsmATStop[gsm.idx].txbuf);
-				DPRINT("%04d| GSM : AT STOP %d -> TX\n", HAL_GetTick()/1000, gsm.idx);
+				memset(tx_buf, 0, sizeof(tx_buf));
+				strcpy((char *)tx_buf, sGsmATStop[idx].tx_buf);
+				DPRINT("%04d| GSM : AT STOP %d -> TX\n", HAL_GetTick()/1000, idx);
 #ifdef PRINT_GSM_TX
-				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.txbuf);
+				DPRINT("%04d| TX BUFFER -> %s\n", HAL_GetTick()/1000, tx_buf);
 #endif
-				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)gsm.txbuf, strlen((char *)gsm.txbuf));			
-				gsm.time = HAL_GetTick();
+				HAL_UART_Transmit_DMA(&huart3, (uint8_t *)tx_buf, strlen((char *)tx_buf));			
+				time = HAL_GetTick();
 				gsm.state = GSM_STATE_STOP_RX;
 			}
 			break;
 			case GSM_STATE_STOP_RX:
 			{
 				// Check timeout
-				if ((HAL_GetTick() - gsm.time) > sGsmATStop[gsm.idx].time)
+				if ((HAL_GetTick() - time) > sGsmATStop[idx].time)
 				{
-					DPRINT("%04d| GSM : AT STOP %d -> TIMEOUT\n", HAL_GetTick()/1000, gsm.idx);
+					DPRINT("%04d| GSM : AT STOP %d -> TIMEOUT\n", HAL_GetTick()/1000, idx);
 #ifdef PRINT_GSM_RX
-					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+					DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
-					gsm.retry++;
-					if (gsm.retry > GSM_STOP_RETRY) {gsm.state = GSM_STATE_INIT;}
+					retry++;
+					if (retry > GSM_STOP_RETRY) {gsm.state = GSM_STATE_INIT;}
 					else {gsm.state = GSM_STATE_STOP_TX;}
 				}
 				else
 				{
 					// Check received buffer
-					char *ptr = strstr((char *)gsm.rxbuf, sGsmATStop[gsm.idx].rxbuf1);
+					char *ptr = strstr((char *)rx_buf, sGsmATStop[idx].rx_buf1);
 					if (ptr != NULL)
 					{
-						ptr = strstr(ptr, sGsmATStop[gsm.idx].rxbuf2);
+						ptr = strstr(ptr, sGsmATStop[idx].rx_buf2);
 						if (ptr != NULL)
 						{
-							DPRINT("%04d| GSM : AT STOP %d -> RX OK\n", HAL_GetTick()/1000, gsm.idx);
+							DPRINT("%04d| GSM : AT STOP %d -> RX OK\n", HAL_GetTick()/1000, idx);
 #ifdef PRINT_GSM_RX
-							DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, gsm.rxbuf);
+							DPRINT("%04d| RX BUFFER -> %s\n", HAL_GetTick()/1000, rx_buf);
 #endif
-							gsm.idx++;
+							idx++;
 							uint32_t nb_at = sizeof(sGsmATStop) / sizeof(sGsmATStop[0]);
-							if (gsm.idx < nb_at) {gsm.state = GSM_STATE_STOP_TX;}
+							if (idx < nb_at) {gsm.state = GSM_STATE_STOP_TX;}
 							else {gsm.state = GSM_STATE_INIT;}
 						}
 					}
@@ -643,21 +668,145 @@ void StartGsmTask(void *argument)
 
 			default: break;
 		}
-		
-		// GSM status
-		gsm_status_t status;
-		if (gsm.state <= GSM_STATE_CK_STATUS) {status = GSM_STATUS_STOP;}
-		else if (gsm.state < GSM_STATE_TCP_CONNECT_INIT) {status = GSM_STATUS_DISCONNECTED;}
-		else if (gsm.state < GSM_STATE_TCP_RECV_INIT) {status = GSM_STATUS_CONNECTING;}
-		else {status = GSM_STATUS_CONNECTED;}
-		if (status != gsm.status)
+	
+		// Socket close management
+		if( (gsm.close) && (GSM_STATE_INIT < gsm.state) && (gsm.state < GSM_STATE_STOP_INIT) )
 		{
-			gsm.status = status;
-			osMessageQueueReset(MsgTcpStatus);
-			osMessageQueuePut(MsgTcpStatus, &gsm.status, 0U, 0U);
+			if (gsm.state <= GSM_STATE_TCP_CONNECT_INIT) {gsm.state = GSM_STATE_STOP_INIT;}
+			else {gsm.state = GSM_STATE_INIT;}
 		}
 		
 		// Delay
 		osDelay(10);
 	}
+}
+
+
+/**
+  * @brief  Socket status
+  * @param  argument: Not used
+  * @retval Socket status
+  */
+static gsm_status_t gsm_get_status(void)
+{
+	gsm_status_t status;
+	if (gsm.state <= GSM_STATE_INIT) {status = GSM_STATUS_STOP;}
+	else if (gsm.state < GSM_STATE_TCP_CONNECT_INIT) {status = GSM_STATUS_INIT;}
+	else if (gsm.state < GSM_STATE_TCP_RECV_INIT) {status = GSM_STATUS_CONNECTING;}
+	else {status = GSM_STATUS_CONNECTED;}
+	return status;
+}
+
+/* Public functions ----------------------------------------------------------*/
+
+/**
+  * @brief  Socket init
+  * @param  argument: Not used
+  * @retval Status
+  */
+status_t socket_init(void)
+{
+	// Init socket
+	uint32_t time = HAL_GetTick();
+	gsm.close = FALSE;
+	gsm.init = TRUE;
+	while (gsm_get_status() <= GSM_STATUS_INIT)
+	{
+		if ((HAL_GetTick() - time) > SOCKET_INIT_TIMEOUT) {return STATUS_ERROR;}
+		osDelay(10);
+	}
+	
+	// return
+	return STATUS_SUCCESS;
+}
+
+/**
+  * @brief  Socket open
+  * @param  argument: Not used
+  * @retval Status
+  */
+status_t socket_open(char *hostname, uint16_t port)
+{
+	// Store IP address and TCP port
+	if (strlen(hostname) > GSM_HOSTNAME_LEN) {return STATUS_ERROR;}
+	strcpy(gsm.hostname, hostname);
+	sprintf(gsm.tcp_port, "%u", port);
+	if (strlen(gsm.tcp_port) > GSM_TCP_PORT_LEN) {return STATUS_ERROR;}
+	
+	// Connect socket
+	uint32_t time = HAL_GetTick();
+	gsm.connect = TRUE;
+	while (gsm_get_status() <= GSM_STATUS_CONNECTING)
+	{
+		if ((HAL_GetTick() - time) > SOCKET_OPEN_TIMEOUT) {return STATUS_ERROR;}
+		osDelay(10);
+	}
+	
+	// return
+	return STATUS_SUCCESS;
+}
+
+/**
+  * @brief  Socket close
+  * @param  argument: Not used
+  * @retval Status
+  */
+status_t socket_close(void)
+{
+	// Connect socket
+	uint32_t time = HAL_GetTick();
+	gsm.init = FALSE;
+	gsm.connect = FALSE;
+	gsm.close = TRUE;
+	while (gsm_get_status() != GSM_STATUS_STOP)
+	{
+		if ((HAL_GetTick() - time) > SOCKET_INIT_TIMEOUT) {return STATUS_ERROR;}
+		osDelay(10);
+	}
+	
+	// return
+	return STATUS_SUCCESS;
+}
+
+/**
+  * @brief  Socket send
+  * @param  argument: data, len
+  * @retval Status
+  */
+status_t socket_send(void *data, uint32_t len)
+{
+	// Check limits
+	if (len > GSM_MSG_TCP_LEN) {return STATUS_ERROR;}
+	if (gsm_get_status() != GSM_STATUS_CONNECTED) {return STATUS_ERROR;}
+	
+	// Send message
+	gsm_msg_tcp_t msg_tx;
+	memcpy(msg_tx.data, data, len);
+	msg_tx.len = len;
+	if (osMessageQueuePut(MsgTcpTx, &msg_tx, 0U, 0U) != osOK) {return STATUS_ERROR;}
+	//DPRINT("%04d| SEND MSG -> %s\n", HAL_GetTick()/1000, (char *)msg_tx.data);
+
+	// return
+	return STATUS_SUCCESS;
+}
+
+/**
+  * @brief  Socket receive
+  * @param  argument: data, len
+  * @retval Status
+  */
+status_t socket_recv(void *data, uint32_t *len)
+{
+	// Check limits
+	if (gsm_get_status() != GSM_STATUS_CONNECTED) {return STATUS_ERROR;}
+	
+	// Check message
+	gsm_msg_tcp_t msg_rx;
+	if (osMessageQueueGet(MsgTcpRx, &msg_rx, NULL, 0U) != osOK) {return STATUS_ERROR;}
+	memcpy(data, msg_rx.data, msg_rx.len);
+	*len = msg_rx.len;
+	//DPRINT("%04d| RECV MSG -> %s\n", HAL_GetTick()/1000, (char *)msg_rx.data);
+	
+	// return
+	return STATUS_SUCCESS;
 }

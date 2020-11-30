@@ -18,8 +18,8 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include "main.h"
 #include "cmsis_os.h"
+#include "main.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -52,14 +52,14 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t) osPriorityLow,
   .stack_size = 128 * 4
 };
-/* USER CODE BEGIN PV */
 
-extern osMessageQueueId_t MsgTcpRx;
-extern osMessageQueueId_t MsgTcpTx;
-extern osMessageQueueId_t MsgTcpStatus;
+osMutexId printMutex;
+osMutexDef(printMutex);
+
+/* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
 
@@ -118,6 +118,9 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
+	
+  printMutex = osMutexNew(osMutex(printMutex));
+	
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -366,42 +369,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
-
 }
 
 
 /* USER CODE BEGIN 4 */
-
-/**
-  * @brief  Hexadecimal-to-ASCII string conversion
-  * @retval String
-  */
-static char hexStr[256];
-char *hex2Str(uint8_t *data, uint32_t dataLen)
-{
-	uint8_t *pin = data;
-	const char *hex = "0123456789ABCDEF";
-	char *pout = hexStr;
-	uint8_t i = 0;
-
-	if(dataLen == 0)
-	{
-		pout[0] = 0;     
-	} 
-	else     
-	{
-		for(; i < dataLen - 1; ++i)
-		{
-			*pout++ = hex[(*pin >> 4) & 0x0F];
-			*pout++ = hex[(*pin++) & 0x0F];
-		}
-		*pout++ = hex[(*pin >> 4) & 0x0F];
-		*pout++ = hex[(*pin) & 0x0F];
-		*pout = 0;
-	}    
-	return hexStr;
-}
-
+		
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -414,40 +386,50 @@ char *hex2Str(uint8_t *data, uint32_t dataLen)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-
 	
 	///////////////////////////////////////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////////////////////
 	// EXAMPLE : TCP MESSAGES
-
-	gsm_msg_tcp_t msg_rx;
-	gsm_status_t status; 
+	
+#define	SERVER_HOSTNAME								("dpedesign.freeboxos.fr")	// Server hostname
+#define	SERVER_TCP_PORT								(23456)											// Server TCP port
+	
+	char server_hostname[] = SERVER_HOSTNAME;
+	uint16_t server_tcp_port = SERVER_TCP_PORT;
+	
+	char tx_data[64] = "HELLO WORLD\r\n";
+	uint32_t tx_len = strlen(tx_data);
+	char rx_data[64];
+	uint32_t rx_len;
+	
+	uint32_t delay = 0;
 	
   /* Infinite loop */
   for(;;)
   {
-		// Check TCP status
-		osMessageQueueGet(MsgTcpStatus, &status, 0U, 0U);
-		if (status == GSM_STATUS_CONNECTED)
+		socket_close();
+		if (socket_init() == STATUS_ERROR) {Error_Handler();}
+		if (socket_open(server_hostname, server_tcp_port) == STATUS_ERROR) {Error_Handler();}
+
+		for(uint32_t i = 0 ; i < 10 ; i++)
 		{
-			// Send periodic TCP message
-			gsm_msg_tcp_t msg_tx;
-			static uint8_t cnt = 0;
-			sprintf((char *)msg_tx.data, "cnt=%d\r", cnt++);
-			msg_tx.size = strlen((char *)msg_tx.data);
-			osMessageQueuePut(MsgTcpTx, &msg_tx, 0U, 0U);
-			osDelay(5000);
-		
-			// Echo TCP message
-			if (osMessageQueueGet(MsgTcpRx, &msg_rx, NULL, 0U) == osOK)
-			{
-				DPRINT("%04d| MAIN : RECV MSG -> %s\n", HAL_GetTick()/1000, (char *)msg_rx.data);
-				osMessageQueuePut(MsgTcpTx, &msg_rx, 0U, 0U);
-			}	
+			socket_send(tx_data, tx_len);
+			tx_data[tx_len] = '\0';
+			DPRINT("%04d| SEND : %s\n", HAL_GetTick()/1000, tx_data);
+			osDelay(10);
 		}
-		// Delay
-		osDelay(10);
-  }
+	
+		delay = HAL_GetTick();
+		while ((HAL_GetTick() - delay) < 5000)
+		{
+			if (socket_recv(rx_data, &rx_len) == STATUS_SUCCESS)
+			{
+				rx_data[rx_len] = '\0';
+				DPRINT("%04d| RECV : %s\n", HAL_GetTick()/1000, rx_data);
+			}
+			osDelay(10);
+		}
+	}
 
 	///////////////////////////////////////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////////////////////

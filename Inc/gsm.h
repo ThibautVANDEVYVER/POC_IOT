@@ -19,19 +19,9 @@ extern "C" {
 /* Exported typedefs ---------------------------------------------------------*/
 typedef enum
 {
-	GSM_STATUS_STOP					= 0,
-	GSM_STATUS_DISCONNECTED	= 1,
-	GSM_STATUS_CONNECTING		= 2,
-	GSM_STATUS_CONNECTED		= 3,
-} gsm_status_t;
-
-#define GSM_MSG_TCP_NB	        (4UL)
-#define GSM_MSG_TCP_SIZE   			(64UL)
-typedef struct
-{
-	uint8_t data[GSM_MSG_TCP_SIZE];
-	uint32_t size;
-} gsm_msg_tcp_t;
+	STATUS_SUCCESS		= 0,
+	STATUS_ERROR,
+} status_t;
 
 /* Exported variables constants ----------------------------------------------*/
 extern osThreadId_t gsmTaskHandle;
@@ -41,6 +31,13 @@ extern const osThreadAttr_t gsmTask_attributes;
 
 /* Exported functions prototypes ---------------------------------------------*/
 void StartGsmTask(void *argument);
+
+/* Public functions prototypes -----------------------------------------------*/
+status_t socket_init(void);
+status_t socket_open(char *hostname, uint16_t port);
+status_t socket_close(void);
+status_t socket_send(void *data, uint32_t len);
+status_t socket_recv(void *data, uint32_t *len);
 
 
 #ifdef __cplusplus
